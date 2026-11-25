@@ -1,4 +1,4 @@
-// Gerenciador Híbrido WebRTC P2P + Ponte Automática pelo Servidor (100% autônomo, sem TURN externo)
+// Gerenciador Híbrido 2.0: Voz + Webcam + Tela 4K + Push-to-Talk + Ping + Ponte Automática
 (function (global) {
   const QUALITY_PRESETS = {
     '720p30': { width: { ideal: 1280, max: 1280 }, height: { ideal: 720, max: 720 }, frameRate: { ideal: 30, max: 30 }, maxBitrate: 3_000_000, contentHint: 'motion', relayMaxWidth: 960, relayFps: 12, relayQuality: 0.6 },
@@ -19,10 +19,13 @@
       this.getUserMeta = options.getUserMeta;
       this.onScreenStreamsChanged = options.onScreenStreamsChanged || (() => {});
       this.onRelayScreenFrame = options.onRelayScreenFrame || (() => {});
+      this.onCamerasChanged = options.onCamerasChanged || (() => {});
+      this.onRelayCamFrame = options.onRelayCamFrame || (() => {});
       this.onSpeakingChange = options.onSpeakingChange || (() => {});
       this.onLocalMicLevel = options.onLocalMicLevel || (() => {});
       this.onPeerStateChange = options.onPeerStateChange || (() => {});
       this.onAutoplayBlocked = options.onAutoplayBlocked || (() => {});
+      this.onLatencyUpdate = options.onLatencyUpdate || (() => {});
       this.onStateChange = options.onStateChange || (() => {});
       this.onToast = options.onToast || (() => {});
 
@@ -31,11 +34,22 @@
       this.muted = false;
       this.deafened = false;
       this.listenOnly = false;
+      this.cameraOn = false;
       this.screenSharing = false;
       this.selectedMicId = '';
+      this.selectedCamId = '';
       this.screenQuality = '1080p30';
       this.activeScreenOwnerId = null;
       this.streamVolume = 0.8;
+
+      // Push-to-Talk
+      this.pttEnabled = false;
+      this.pttPressed = false;
+      this._pttReleaseTimer = null;
+
+      // Ping em ms
+      this.latencyMs = null;
+      this._pingInterval = null;
 
       this.iceServers = [
         { urls: 'stun:stun.l.google.com:19302' },
@@ -44,22 +58,20 @@
       this.hasTurn = false;
 
       this.localVoiceStream = null;
+      this.localCameraStream = null;
       this.localScreenStream = null;
 
-      // Map<peerId, PeerEntry>
       this.peers = new Map();
-      // Map<peerId, number> (0..1)
       this.peerVolumes = new Map();
 
-      // Web Audio API (medidor, anel verde e captura/reprodução da Ponte)
       this.audioCtx = null;
       this.workletLoaded = false;
       this.analysers = new Map();
       this.vadTimer = null;
 
-      // Captura da Ponte (Voz e Tela)
       this._voiceRelayCapture = null;
       this._voiceHangoverUntil = 0;
+      this._camRelayCapture = null;
       this._screenRelayCapture = null;
       this._screenAudioRelayCapture = null;
       this._screenAudioGain = null;
@@ -81,9 +93,29 @@
             this.hasTurn = Boolean(data.hasTurn);
           }
         }
-      } catch (err) {
-        console.warn('[WebRTC] Usando STUN padrão:', err.message);
+      } catch {}
+    }
+
+    startLatencyMonitor() {
+      this.stopLatencyMonitor();
+      const measure = () => {
+        if (!this.socket.connected) return;
+        const t0 = performance.now();
+        this.socket.emit('ping-check', () => {
+          this.latencyMs = Math.max(1, Math.round(performance.now() - t0));
+          this.onLatencyUpdate(this.latencyMs);
+        });
+      };
+      measure();
+      this._pingInterval = setInterval(measure, 4000);
+    }
+
+    stopLatencyMonitor() {
+      if (this._pingInterval) {
+        clearInterval(this._pingInterval);
+        this._pingInterval = null;
       }
+      this.latencyMs = null;
     }
 
     _bindSocketEvents() {
@@ -108,6 +140,11 @@
           peer.relayScreenHasAudio = false;
           this.onScreenStreamsChanged();
         }
+        if (!user.cameraOn && (peer.cameraStream || peer.relayCamActive)) {
+          peer.cameraStream = null;
+          peer.relayCamActive = false;
+          this.onCamerasChanged();
+        }
       });
 
       this.socket.on('webrtc-signal', ({ from, description, candidate }) => {
@@ -126,13 +163,30 @@
         if (!this.inVoice || !from || from === this.myId || !chunk) return;
         const peer = this.peers.get(from);
         if (!peer) return;
-        // Se WebRTC P2P já está ativo para este amigo, ignora para não duplicar áudio
         if (this._isPeerWebRtcConnected(peer)) return;
 
         if (peer.transport !== 'relay') {
           this._activateRelayForPeer(peer);
         }
         this._playRelayVoiceChunk(peer, chunk);
+      });
+
+      this.socket.on('relay-cam-frame', ({ from, frame, width, height }) => {
+        if (!this.inVoice || !from || from === this.myId || !frame) return;
+        const peer = this.peers.get(from);
+        if (!peer) return;
+        if (this._isPeerWebRtcConnected(peer) && peer.cameraStream) return;
+
+        if (peer.transport !== 'relay') {
+          this._activateRelayForPeer(peer);
+        }
+
+        const wasActive = peer.relayCamActive;
+        peer.relayCamActive = true;
+        if (!wasActive) {
+          this.onCamerasChanged();
+        }
+        this.onRelayCamFrame(from, frame, width, height);
       });
 
       this.socket.on('relay-screen-frame', ({ from, frame, width, height, hasAudio }) => {
@@ -234,11 +288,60 @@
       }
     }
 
+    // ==================== PUSH-TO-TALK ====================
+
+    setPttMode(enabled) {
+      this.pttEnabled = Boolean(enabled);
+      clearTimeout(this._pttReleaseTimer);
+      this.pttPressed = false;
+      if (this.inVoice && !this.listenOnly && !this.deafened) {
+        this.muted = this.pttEnabled;
+        this._applyLocalMicEnabled();
+        this._emitMediaState();
+        this.onStateChange();
+      }
+    }
+
+    setPttActive(pressed) {
+      if (!this.inVoice || !this.pttEnabled || this.listenOnly || this.deafened) return;
+      clearTimeout(this._pttReleaseTimer);
+
+      if (pressed) {
+        if (this.pttPressed && !this.muted) return;
+        this.pttPressed = true;
+        this.muted = false;
+        this._applyLocalMicEnabled();
+        this._emitMediaState();
+        this.onStateChange();
+      } else {
+        this.pttPressed = false;
+        // Mantém 120 ms extras para não cortar o final da frase
+        this._pttReleaseTimer = setTimeout(() => {
+          if (!this.pttPressed && this.pttEnabled && this.inVoice && !this.listenOnly) {
+            this.muted = true;
+            this._applyLocalMicEnabled();
+            this._emitMediaState();
+            this.onStateChange();
+          }
+        }, 120);
+      }
+    }
+
     async listMicrophones() {
       if (!navigator.mediaDevices || !navigator.mediaDevices.enumerateDevices) return [];
       try {
         const devices = await navigator.mediaDevices.enumerateDevices();
         return devices.filter((d) => d.kind === 'audioinput');
+      } catch {
+        return [];
+      }
+    }
+
+    async listCameras() {
+      if (!navigator.mediaDevices || !navigator.mediaDevices.enumerateDevices) return [];
+      try {
+        const devices = await navigator.mediaDevices.enumerateDevices();
+        return devices.filter((d) => d.kind === 'videoinput');
       } catch {
         return [];
       }
@@ -250,19 +353,18 @@
       await this._iceConfigPromise;
 
       this.listenOnly = Boolean(listenOnly);
-      this.muted = this.listenOnly;
+      this.muted = this.listenOnly || this.pttEnabled;
       this.deafened = false;
 
       if (!this.listenOnly) {
         try {
           this.localVoiceStream = await this._captureMicrophone(this.selectedMicId);
+          this._applyLocalMicEnabled();
         } catch (err) {
-          console.warn('[WebRTC] Falha ao capturar microfone:', err);
           return { ok: false, error: this._friendlyMediaError(err, 'microfone') };
         }
       }
 
-      // Garante AudioContext desbloqueado durante o clique do usuário
       this._ensureAudioCtx();
 
       this.inVoice = true;
@@ -311,7 +413,8 @@
       }
 
       this.listenOnly = false;
-      this.muted = false;
+      this.muted = this.pttEnabled && !this.pttPressed;
+      this._applyLocalMicEnabled();
       this._attachAnalyser(this.myId, this.localVoiceStream);
 
       this._emitMediaState();
@@ -352,7 +455,6 @@
         this._detachAnalyser(this.myId);
         this._attachAnalyser(this.myId, this.localVoiceStream);
 
-        // Reinicia captura da ponte com o novo microfone se estiver ativa
         if (this._voiceRelayCapture) {
           this._stopRelayVoiceCapture();
           this._startRelayVoiceCapture();
@@ -365,14 +467,184 @@
       }
     }
 
+    // ==================== WEBCAM ====================
+
+    async toggleCamera() {
+      if (this.cameraOn) {
+        this.stopCamera();
+        return { ok: true, cameraOn: false };
+      }
+      return this.startCamera();
+    }
+
+    async startCamera() {
+      if (!this.inVoice) {
+        return { ok: false, error: 'Entre no canal de voz primeiro para ligar a câmera.' };
+      }
+      if (this.cameraOn) return { ok: true, cameraOn: true };
+      if (!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia) {
+        return { ok: false, error: 'Navegador sem suporte a câmera.' };
+      }
+
+      const videoConstraints = {
+        width: { ideal: 640, max: 1280 },
+        height: { ideal: 360, max: 720 },
+        frameRate: { ideal: 24, max: 30 },
+      };
+      if (this.selectedCamId) {
+        videoConstraints.deviceId = { exact: this.selectedCamId };
+      }
+
+      let stream;
+      try {
+        stream = await navigator.mediaDevices.getUserMedia({ video: videoConstraints, audio: false });
+      } catch (err) {
+        return { ok: false, error: this._friendlyMediaError(err, 'câmera') };
+      }
+
+      this.localCameraStream = stream;
+      this.cameraOn = true;
+
+      const track = stream.getVideoTracks()[0];
+      if (track) {
+        track.onended = () => this.stopCamera();
+      }
+
+      this._emitMediaState();
+
+      for (const peer of this.peers.values()) {
+        for (const t of stream.getTracks()) {
+          const sender = peer.pc.addTrack(t, stream);
+          peer.cameraSenders.push(sender);
+        }
+      }
+
+      this._syncRelaySenders();
+      this.onCamerasChanged();
+      this.onStateChange();
+      return { ok: true, cameraOn: true };
+    }
+
+    stopCamera({ notifyServer = true } = {}) {
+      if (!this.cameraOn && !this.localCameraStream) return;
+
+      this._stopRelayCamCapture();
+
+      for (const peer of this.peers.values()) {
+        for (const sender of peer.cameraSenders) {
+          try {
+            peer.pc.removeTrack(sender);
+          } catch {}
+        }
+        peer.cameraSenders = [];
+      }
+
+      if (this.localCameraStream) {
+        this.localCameraStream.getTracks().forEach((t) => {
+          t.onended = null;
+          t.stop();
+        });
+        this.localCameraStream = null;
+      }
+
+      this.cameraOn = false;
+      if (notifyServer) {
+        this._emitMediaState();
+      }
+      this.onCamerasChanged();
+      this.onStateChange();
+    }
+
+    async switchCamera(deviceId) {
+      this.selectedCamId = deviceId || '';
+      if (!this.inVoice || !this.cameraOn || !this.localCameraStream) return { ok: true };
+
+      try {
+        const videoConstraints = {
+          width: { ideal: 640, max: 1280 },
+          height: { ideal: 360, max: 720 },
+          frameRate: { ideal: 24, max: 30 },
+        };
+        if (this.selectedCamId) videoConstraints.deviceId = { exact: this.selectedCamId };
+        const newStream = await navigator.mediaDevices.getUserMedia({ video: videoConstraints, audio: false });
+        const newTrack = newStream.getVideoTracks()[0];
+        if (!newTrack) return { ok: false, error: 'Câmera não encontrada.' };
+
+        newTrack.onended = () => this.stopCamera();
+
+        for (const peer of this.peers.values()) {
+          for (const sender of peer.cameraSenders) {
+            if (sender.track && sender.track.kind === 'video') {
+              await sender.replaceTrack(newTrack);
+            }
+          }
+        }
+
+        this.localCameraStream.getTracks().forEach((t) => t.stop());
+        this.localCameraStream = newStream;
+
+        if (this._camRelayCapture) {
+          this._stopRelayCamCapture();
+          this._startRelayCamCapture();
+        }
+
+        this._emitMediaState();
+        this.onCamerasChanged();
+        return { ok: true };
+      } catch (err) {
+        return { ok: false, error: this._friendlyMediaError(err, 'câmera') };
+      }
+    }
+
+    getActiveCameras() {
+      const list = [];
+      if (this.localCameraStream) {
+        list.push({
+          ownerId: this.myId,
+          isSelf: true,
+          isRelay: false,
+          stream: this.localCameraStream,
+        });
+      }
+      for (const [peerId, peer] of this.peers.entries()) {
+        const webrtcLive =
+          this._isPeerWebRtcConnected(peer) &&
+          peer.cameraStream &&
+          peer.cameraStream.getVideoTracks().some((t) => t.readyState === 'live');
+        if (webrtcLive) {
+          list.push({
+            ownerId: peerId,
+            isSelf: false,
+            isRelay: false,
+            stream: peer.cameraStream,
+          });
+        } else if (peer.relayCamActive) {
+          list.push({
+            ownerId: peerId,
+            isSelf: false,
+            isRelay: true,
+            stream: null,
+          });
+        }
+      }
+      return list;
+    }
+
     leaveVoice({ notifyServer = true } = {}) {
       if (!this.inVoice) return;
 
+      clearTimeout(this._pttReleaseTimer);
+      this.pttPressed = false;
+
+      if (this.cameraOn) {
+        this.stopCamera({ notifyServer: false });
+      }
       if (this.screenSharing) {
         this.stopScreenShare({ notifyServer: false });
       }
 
       this._stopRelayVoiceCapture();
+      this._stopRelayCamCapture();
       this._stopRelayScreenCapture();
 
       for (const peerId of Array.from(this.peers.keys())) {
@@ -384,6 +656,7 @@
       this.muted = false;
       this.deafened = false;
       this.listenOnly = false;
+      this.cameraOn = false;
       this.screenSharing = false;
       this.onAutoplayBlocked(false);
       this.onLocalMicLevel(0);
@@ -392,6 +665,7 @@
         this.socket.emit('voice-leave');
       }
 
+      this.onCamerasChanged();
       this.onScreenStreamsChanged();
       this.onStateChange();
     }
@@ -420,7 +694,7 @@
       if (this.deafened && !this.listenOnly) {
         this.muted = true;
       } else if (!this.deafened && !this.listenOnly) {
-        this.muted = false;
+        this.muted = this.pttEnabled && !this.pttPressed;
       }
       this._applyLocalMicEnabled();
       this._applyDeafenToRemoteAudio();
@@ -453,7 +727,6 @@
         if (this.inVoice) this._ensurePeer(peerId);
         return;
       }
-      // Ativa a Ponte imediatamente se ainda não estiver conectada, e tenta WebRTC em paralelo
       this._activateRelayForPeer(peer);
       peer.established = true;
       peer.signalQueue = peer.signalQueue
@@ -502,7 +775,6 @@
       this.screenQuality = preset;
       const cfg = QUALITY_PRESETS[preset];
 
-      // Se já estiver transmitindo, aplica a nova resolução/FPS ao vivo
       if (this.screenSharing && this.localScreenStream) {
         const videoTrack = this.localScreenStream.getVideoTracks()[0];
         if (videoTrack) {
@@ -681,7 +953,7 @@
       return list;
     }
 
-    // ==================== PONTE PELO SERVIDOR (FALLBACK AUTÔNOMO) ====================
+    // ==================== PONTE PELO SERVIDOR ====================
 
     _isPeerWebRtcConnected(peer) {
       const ice = peer.pc.iceConnectionState;
@@ -717,6 +989,12 @@
         this._stopRelayVoiceCapture();
       }
 
+      if (needRelay && this.cameraOn && this.localCameraStream) {
+        this._startRelayCamCapture();
+      } else {
+        this._stopRelayCamCapture();
+      }
+
       if (needRelay && this.screenSharing && this.localScreenStream) {
         this._startRelayScreenCapture();
       } else {
@@ -735,7 +1013,6 @@
       const silentGain = ctx.createGain();
       silentGain.gain.value = 0;
 
-      // Usa AudioWorklet quando disponível (mais leve e sem engasgos)
       if (ctx.audioWorklet) {
         try {
           if (!this.workletLoaded) {
@@ -761,12 +1038,9 @@
               } catch {}
             },
           };
-        } catch (err) {
-          console.warn('[Relay] AudioWorklet indisponível, usando ScriptProcessor:', err.message);
-        }
+        } catch {}
       }
 
-      // Fallback universal (ScriptProcessorNode)
       const ratio = ctx.sampleRate / targetSampleRate;
       const chunkSize = Math.round(targetSampleRate * 0.08);
       const outBuf = new Int16Array(chunkSize);
@@ -812,7 +1086,6 @@
       const cap = await this._createPcmCapture(this.localVoiceStream, VOICE_RELAY_RATE, (buffer) => {
         if (!this.inVoice || this.muted || this.deafened || this.listenOnly || !this._hasRelayPeers()) return;
 
-        // Supressão suave de silêncio com folga de 450 ms para não cortar final de palavras
         const samples = new Int16Array(buffer);
         let sumSq = 0;
         for (let i = 0; i < samples.length; i += 4) {
@@ -839,6 +1112,74 @@
       if (this._voiceRelayCapture) {
         this._voiceRelayCapture.stop();
         this._voiceRelayCapture = null;
+      }
+    }
+
+    _startRelayCamCapture() {
+      if (this._camRelayCapture || !this.localCameraStream) return;
+
+      const hiddenVideo = document.createElement('video');
+      hiddenVideo.muted = true;
+      hiddenVideo.playsInline = true;
+      hiddenVideo.autoplay = true;
+      hiddenVideo.srcObject = this.localCameraStream;
+      hiddenVideo.play().catch(() => {});
+
+      const canvas = document.createElement('canvas');
+      const ctx2d = canvas.getContext('2d', { alpha: false });
+      let encoding = false;
+      let stopped = false;
+
+      const timer = setInterval(() => {
+        if (stopped || encoding || !this.cameraOn || !this._hasRelayPeers()) return;
+        const vw = hiddenVideo.videoWidth;
+        const vh = hiddenVideo.videoHeight;
+        if (!vw || !vh) return;
+
+        const maxW = 360;
+        const scale = vw > maxW ? maxW / vw : 1;
+        const cw = Math.max(2, Math.round((vw * scale) / 2) * 2);
+        const ch = Math.max(2, Math.round((vh * scale) / 2) * 2);
+        if (canvas.width !== cw || canvas.height !== ch) {
+          canvas.width = cw;
+          canvas.height = ch;
+        }
+
+        ctx2d.drawImage(hiddenVideo, 0, 0, cw, ch);
+        encoding = true;
+
+        canvas.toBlob(
+          async (blob) => {
+            try {
+              if (!stopped && blob && this.cameraOn && this._hasRelayPeers()) {
+                const buf = await blob.arrayBuffer();
+                this.socket.volatile.emit('relay-cam-frame', {
+                  frame: buf,
+                  width: cw,
+                  height: ch,
+                });
+              }
+            } catch {}
+            encoding = false;
+          },
+          'image/webp',
+          0.58
+        );
+      }, 110); // ~9 FPS leve para webcam
+
+      this._camRelayCapture = {
+        stop() {
+          stopped = true;
+          clearInterval(timer);
+          hiddenVideo.srcObject = null;
+        },
+      };
+    }
+
+    _stopRelayCamCapture() {
+      if (this._camRelayCapture) {
+        this._camRelayCapture.stop();
+        this._camRelayCapture = null;
       }
     }
 
@@ -895,7 +1236,7 @@
             encoding = false;
           },
           'image/webp',
-          preset.relayQuality || 0.62
+          preset.relayQuality || 0.65
         );
       }, intervalMs);
 
@@ -907,7 +1248,6 @@
         },
       };
 
-      // Captura também o áudio do sistema da tela, se o usuário marcou "Compartilhar áudio"
       if (hasAudio && !this._screenAudioRelayCapture) {
         this._screenAudioRelayCapture = { pending: true, stop() {} };
         this._createPcmCapture(this.localScreenStream, SCREEN_AUDIO_RELAY_RATE, (buffer) => {
@@ -966,7 +1306,6 @@
         sumSq += v * v;
       }
 
-      // Atualiza anel verde de fala para este amigo
       const rms = Math.sqrt(sumSq / float32.length);
       if (rms > 0.015) {
         if (!peer.relaySpeaking) {
@@ -1056,14 +1395,14 @@
 
     _friendlyMediaError(err, kind) {
       if (!window.isSecureContext) {
-        return `Para usar ${kind}, abra o app via localhost ou link HTTPS (ex: túnel Cloudflare ou servidor hospedado).`;
+        return `Para usar ${kind}, abra o app via localhost ou link HTTPS.`;
       }
       if (!err) return `Não foi possível acessar ${kind}.`;
       if (err.name === 'NotAllowedError' || err.name === 'PermissionDeniedError') {
         return `Permissão negada para acessar ${kind}. Libere no cadeado da barra de endereço do navegador.`;
       }
       if (err.name === 'NotFoundError' || err.name === 'DevicesNotFoundError') {
-        return `Nenhum ${kind} encontrado neste dispositivo. Você pode entrar no modo "Só ouvir".`;
+        return `Nenhum ${kind} encontrado neste dispositivo.`;
       }
       if (err.name === 'NotReadableError') {
         return `O ${kind} parece estar ocupado por outro programa.`;
@@ -1098,13 +1437,16 @@
         nextVoiceTime: 0,
         relaySpeaking: false,
         relaySpeakTimer: null,
+        relayCamActive: false,
         relayScreenActive: false,
         relayScreenHasAudio: false,
         localCandCount: 0,
         remoteCandCount: 0,
         voiceSenders: [],
+        cameraSenders: [],
         screenSenders: [],
         voiceStream: null,
+        cameraStream: null,
         screenStream: null,
         audioEl: null,
       };
@@ -1112,7 +1454,6 @@
       this.peers.set(peerId, peer);
       this.onPeerStateChange(peerId, 'connecting');
 
-      // Se o P2P direto não fechar em 3,5s (ex: CGNAT), ativa automaticamente a Ponte pelo servidor!
       peer.relayTimer = setTimeout(() => {
         if (!this.peers.has(peerId)) return;
         if (!this._isPeerWebRtcConnected(peer)) {
@@ -1143,9 +1484,7 @@
                   sdp: pc.localDescription.sdp,
                 },
               });
-            } catch (err) {
-              console.error('[WebRTC] onnegotiationneeded erro:', err);
-            } finally {
+            } catch {} finally {
               peer.makingOffer = false;
             }
           })
@@ -1165,9 +1504,9 @@
           peer.connectionState = 'connected';
           this._syncRelaySenders();
           this.onPeerStateChange(peerId, 'connected');
+          this.onCamerasChanged();
           this.onScreenStreamsChanged();
         } else if (ice === 'failed' || ice === 'disconnected' || conn === 'failed') {
-          // Caiu ou bloqueado por CGNAT -> ativa Ponte imediatamente!
           this._activateRelayForPeer(peer);
         }
       };
@@ -1180,12 +1519,34 @@
         const stream = (event.streams && event.streams[0]) || new MediaStream([track]);
         const meta = this.getUserMeta ? this.getUserMeta(peerId) : null;
 
-        const isScreenTrack =
-          track.kind === 'video' ||
-          (meta && meta.screenStreamId && stream.id === meta.screenStreamId) ||
-          stream.getVideoTracks().length > 0;
+        const isCameraTrack =
+          track.kind === 'video' &&
+          meta &&
+          meta.cameraStreamId &&
+          stream.id === meta.cameraStreamId;
 
-        if (isScreenTrack) {
+        const isScreenTrack =
+          !isCameraTrack &&
+          (track.kind === 'video' ||
+            (meta && meta.screenStreamId && stream.id === meta.screenStreamId) ||
+            stream.getVideoTracks().length > 0);
+
+        if (isCameraTrack) {
+          peer.cameraStream = stream;
+          this.onCamerasChanged();
+          track.onended = () => {
+            if (peer.cameraStream && peer.cameraStream.getVideoTracks().every((t) => t.readyState !== 'live')) {
+              peer.cameraStream = null;
+              this.onCamerasChanged();
+            }
+          };
+          stream.onremovetrack = () => {
+            if (peer.cameraStream && peer.cameraStream.getVideoTracks().length === 0) {
+              peer.cameraStream = null;
+              this.onCamerasChanged();
+            }
+          };
+        } else if (isScreenTrack) {
           if (peer.voiceStream && peer.voiceStream.id === stream.id) {
             this._detachPeerVoiceAudio(peer);
           }
@@ -1217,13 +1578,23 @@
           const sender = pc.addTrack(track, this.localVoiceStream);
           peer.voiceSenders.push(sender);
         }
-      } else if (!peer.polite && !this.localScreenStream) {
+      } else if (!peer.polite && !this.localCameraStream && !this.localScreenStream) {
         pc.addTransceiver('audio', { direction: 'recvonly' });
       }
+      if (this.localCameraStream) {
+        for (const track of this.localCameraStream.getTracks()) {
+          const sender = pc.addTrack(track, this.localCameraStream);
+          peer.cameraSenders.push(sender);
+        }
+      }
       if (this.localScreenStream) {
+        const preset = QUALITY_PRESETS[this.screenQuality] || QUALITY_PRESETS['1080p30'];
         for (const track of this.localScreenStream.getTracks()) {
           const sender = pc.addTrack(track, this.localScreenStream);
           peer.screenSenders.push(sender);
+          if (track.kind === 'video') {
+            this._applyVideoSenderBitrate(sender, preset.maxBitrate);
+          }
         }
       }
 
@@ -1277,6 +1648,7 @@
         } catch {}
       }
 
+      const hadCam = Boolean(peer.cameraStream || peer.relayCamActive);
       const hadScreen = Boolean(peer.screenStream || peer.relayScreenActive);
       this._detachPeerVoiceAudio(peer);
 
@@ -1293,9 +1665,8 @@
       this.onSpeakingChange(peerId, false);
       this._syncRelaySenders();
 
-      if (hadScreen) {
-        this.onScreenStreamsChanged();
-      }
+      if (hadCam) this.onCamerasChanged();
+      if (hadScreen) this.onScreenStreamsChanged();
     }
 
     _applyLocalMicEnabled() {
@@ -1329,8 +1700,10 @@
         muted: this.muted,
         deafened: this.deafened,
         listenOnly: this.listenOnly,
+        cameraOn: this.cameraOn,
         screenSharing: this.screenSharing,
         voiceStreamId: this.localVoiceStream ? this.localVoiceStream.id : null,
+        cameraStreamId: this.localCameraStream ? this.localCameraStream.id : null,
         screenStreamId: this.localScreenStream ? this.localScreenStream.id : null,
       });
     }
