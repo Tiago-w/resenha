@@ -1,4 +1,4 @@
-// Controlador Principal do Resenha 2.0
+// Controlador Principal do Resenha 2.0 (Voz, Tela 4K, Webcam, Soundboard, Apontador, Chat Turbinado, Temas e Segurança)
 (function () {
   const AVATAR_COLORS = [
     '#5865F2',
@@ -16,50 +16,44 @@
     '🚀', '😎', '🤝', '😭', '🤯', '🎉', '👍', '☕',
   ];
 
-  const QUICK_REACTIONS = ['😂', '🔥', '❤️', '👍', '💀'];
+  const REACTION_BAR_EMOJIS = ['😂', '🔥', '❤️', '👍', '💀'];
   const THEMES = ['midnight', 'oled', 'cyber', 'emerald'];
-  const THEME_LABELS = {
-    midnight: 'Meia-Noite',
-    oled: 'OLED Preto',
-    cyber: 'Cyber Roxo',
-    emerald: 'Esmeralda',
-  };
 
   const ROOM_WORDS_A = ['resenha', 'squad', 'noite', 'cafe', 'combo', 'galera', 'festa', 'turbo', 'pixel', 'ponto'];
   const ROOM_WORDS_B = ['vip', 'gamer', 'top', 'azul', 'raiz', 'livre', 'pro', 'br', 'gold', 'max'];
 
   const state = {
     roomCode: null,
-    roomPasswordMemory: '',
     roomMeta: { hostId: null, locked: false, hasPassword: false },
     self: null,
     users: new Map(),
-    messagesById: new Map(),
+    messagesMap: new Map(),
     speakingIds: new Set(),
     typingUsers: new Map(),
     lastMessageMeta: null,
     pendingImageDataUrl: null,
-    replyingToId: null,
-    editingMessageId: null,
+    replyingToMsg: null,
+    editingMsgId: null,
+    lastEnteredPassword: '',
     selectedColor: localStorage.getItem('resenha_color') || AVATAR_COLORS[0],
+    theme: localStorage.getItem('resenha_theme') || 'midnight',
+    voiceMode: localStorage.getItem('resenha_voice_mode') || 'auto', // 'auto' | 'ptt'
+    pttKeyCode: localStorage.getItem('resenha_ptt_key') || 'KeyV',
+    pttKeyLabel: localStorage.getItem('resenha_ptt_label') || 'V',
+    bindingPttKey: false,
     activeScreenOwnerId: null,
     stageHiddenByUser: false,
     streamVolume: 0.8,
     soundsEnabled: localStorage.getItem('resenha_sounds') !== 'false',
-    soundboardVol: Number(localStorage.getItem('resenha_sb_vol') || 70) / 100,
+    soundboardVolume: Number(localStorage.getItem('resenha_sb_vol') || '70') / 100,
     customSounds: loadCustomSounds(),
-    theme: localStorage.getItem('resenha_theme') || 'midnight',
-    voiceMode: localStorage.getItem('resenha_voice_mode') || 'auto',
-    pttKeyCode: localStorage.getItem('resenha_ptt_key') || 'KeyV',
-    pttKeyLabel: localStorage.getItem('resenha_ptt_label') || 'V',
-    bindingPttKey: false,
   };
 
   function loadCustomSounds() {
     try {
       const raw = localStorage.getItem('resenha_custom_sounds');
-      const arr = raw ? JSON.parse(raw) : [];
-      return Array.isArray(arr) ? arr.slice(0, 8) : [];
+      const parsed = raw ? JSON.parse(raw) : [];
+      return Array.isArray(parsed) ? parsed.slice(0, 6) : [];
     } catch {
       return [];
     }
@@ -67,9 +61,9 @@
 
   function saveCustomSounds() {
     try {
-      localStorage.setItem('resenha_custom_sounds', JSON.stringify(state.customSounds));
+      localStorage.setItem('resenha_custom_sounds', JSON.stringify(state.customSounds.slice(0, 6)));
     } catch {
-      showToast('Armazenamento local cheio! Remova algum som antigo.', 'error');
+      showToast('Armazenamento local cheio! Apague algum som antigo.', 'error');
     }
   }
 
@@ -79,10 +73,10 @@
     joinForm: document.getElementById('join-form'),
     nicknameInput: document.getElementById('nickname-input'),
     roomInput: document.getElementById('room-input'),
-    roomPasswordInput: document.getElementById('room-password-input'),
-    roomPasswordLabel: document.getElementById('room-password-label'),
     generateRoomBtn: document.getElementById('generate-room-btn'),
     colorPicker: document.getElementById('color-picker'),
+    roomPasswordInput: document.getElementById('room-password-input'),
+    roomPasswordLabel: document.getElementById('room-password-label'),
     inviteBanner: document.getElementById('invite-banner'),
     inviteRoomLabel: document.getElementById('invite-room-label'),
     lobbyError: document.getElementById('lobby-error'),
@@ -163,8 +157,8 @@
     chatForm: document.getElementById('chat-form'),
     chatInput: document.getElementById('chat-input'),
     attachBtn: document.getElementById('attach-btn'),
-    recordVoiceMsgBtn: document.getElementById('record-voice-msg-btn'),
     imageFileInput: document.getElementById('image-file-input'),
+    recordVoiceMsgBtn: document.getElementById('record-voice-msg-btn'),
     emojiBtn: document.getElementById('emoji-btn'),
 
     soundboardModal: document.getElementById('soundboard-modal'),
@@ -172,8 +166,8 @@
     soundboardVolSlider: document.getElementById('soundboard-vol-slider'),
     soundboardVolLabel: document.getElementById('soundboard-vol-label'),
     soundboardGrid: document.getElementById('soundboard-grid'),
-    addCustomSoundBtn: document.getElementById('add-custom-sound-btn'),
     customSoundInput: document.getElementById('custom-sound-input'),
+    addCustomSoundBtn: document.getElementById('add-custom-sound-btn'),
 
     settingsModal: document.getElementById('settings-modal'),
     closeSettingsBtn: document.getElementById('close-settings-btn'),
@@ -197,17 +191,17 @@
   };
 
   window.ResenhaSounds.enabled = state.soundsEnabled;
-  window.ResenhaSounds.soundboardVolume = state.soundboardVol;
+  window.ResenhaSounds.soundboardVolume = state.soundboardVolume;
   applyTheme(state.theme);
 
   const socket = io({ autoConnect: true });
 
-  // ==================== DESENHO DE FRAMES RELAY (TELA E WEBCAMS) ====================
+  // ==================== DESENHO DE FRAMES RELAY (TELA E WEBCAM) ====================
 
   let relayCanvasBusy = false;
   let lastStageResLabel = '';
   const stageCanvasCtx = els.stageCanvas.getContext('2d', { alpha: false });
-  const camCanvasBusy = new Set();
+  const camRelayBusyMap = new Map();
 
   function updateStageBadgeWithResolution(w, h) {
     if (!w || !h) return;
@@ -229,15 +223,15 @@
     updateStageBadgeWithResolution(els.stageVideo.videoWidth, els.stageVideo.videoHeight);
   });
 
-  async function drawBlobToCanvas(canvas, ctx, frameBuffer, width, height, onDimensions) {
+  async function drawWebpToCanvas(canvasEl, ctx2d, frameBuffer, width, height, onDimensions) {
     const blob = new Blob([frameBuffer], { type: 'image/webp' });
     if (typeof createImageBitmap === 'function') {
       const bitmap = await createImageBitmap(blob);
-      if (canvas.width !== bitmap.width || canvas.height !== bitmap.height) {
-        canvas.width = bitmap.width;
-        canvas.height = bitmap.height;
+      if (canvasEl.width !== bitmap.width || canvasEl.height !== bitmap.height) {
+        canvasEl.width = bitmap.width;
+        canvasEl.height = bitmap.height;
       }
-      ctx.drawImage(bitmap, 0, 0);
+      ctx2d.drawImage(bitmap, 0, 0);
       if (onDimensions) onDimensions(bitmap.width, bitmap.height);
       bitmap.close();
     } else {
@@ -247,11 +241,11 @@
         img.onload = () => {
           const w = width || img.width;
           const h = height || img.height;
-          if (canvas.width !== w || canvas.height !== h) {
-            canvas.width = w;
-            canvas.height = h;
+          if (canvasEl.width !== w || canvasEl.height !== h) {
+            canvasEl.width = w;
+            canvasEl.height = h;
           }
-          ctx.drawImage(img, 0, 0);
+          ctx2d.drawImage(img, 0, 0);
           if (onDimensions) onDimensions(w, h);
           URL.revokeObjectURL(url);
           resolve();
@@ -269,21 +263,21 @@
     if (ownerId !== state.activeScreenOwnerId || state.stageHiddenByUser || relayCanvasBusy) return;
     relayCanvasBusy = true;
     try {
-      await drawBlobToCanvas(els.stageCanvas, stageCanvasCtx, frameBuffer, width, height, updateStageBadgeWithResolution);
+      await drawWebpToCanvas(els.stageCanvas, stageCanvasCtx, frameBuffer, width, height, updateStageBadgeWithResolution);
     } catch {}
     relayCanvasBusy = false;
   }
 
   async function drawRelayCamFrame(ownerId, frameBuffer, width, height) {
-    if (camCanvasBusy.has(ownerId)) return;
-    const canvas = els.cameraStrip.querySelector(`canvas[data-cam-owner="${CSS.escape(ownerId)}"]`);
+    if (camRelayBusyMap.get(ownerId)) return;
+    const canvas = els.cameraStrip.querySelector(`canvas[data-cam-canvas="${CSS.escape(ownerId)}"]`);
     if (!canvas) return;
-    camCanvasBusy.add(ownerId);
+    const ctx2d = canvas.getContext('2d', { alpha: false });
+    camRelayBusyMap.set(ownerId, true);
     try {
-      const ctx = canvas.getContext('2d', { alpha: false });
-      await drawBlobToCanvas(canvas, ctx, frameBuffer, width, height);
+      await drawWebpToCanvas(canvas, ctx2d, frameBuffer, width, height);
     } catch {}
-    camCanvasBusy.delete(ownerId);
+    camRelayBusyMap.set(ownerId, false);
   }
 
   const voice = new window.VoiceManager({
@@ -305,21 +299,14 @@
     onAutoplayBlocked: (blocked) => {
       els.audioUnlockBanner.classList.toggle('hidden', !blocked);
     },
-    onLatencyUpdate: (ms) => {
-      els.pingBadge.textContent = `${ms} ms`;
-      els.pingBadge.classList.remove('good', 'warn', 'bad');
-      if (ms < 90) els.pingBadge.classList.add('good');
-      else if (ms < 200) els.pingBadge.classList.add('warn');
-      else els.pingBadge.classList.add('bad');
-    },
+    onLatencyUpdate: (ms) => updatePingBadge(ms),
     onStateChange: () => updateVoiceDockUI(),
     onToast: (msg, type) => showToast(msg, type),
   });
 
-  // Configura PTT e Qualidade salvos
-  voice.setPttMode(state.voiceMode === 'ptt');
   const savedQuality = localStorage.getItem('resenha_screen_quality');
   if (savedQuality) voice.setScreenQuality(savedQuality);
+  voice.setPttMode(state.voiceMode === 'ptt');
 
   els.unlockAudioBtn.addEventListener('click', () => {
     voice.unlockAudio();
@@ -333,8 +320,8 @@
 
   // ==================== HELPERS ====================
 
-  function isHost() {
-    return Boolean(state.self && state.roomMeta.hostId === state.self.id);
+  function isSelfHost() {
+    return Boolean(state.self && state.roomMeta.hostId && state.self.id === state.roomMeta.hostId);
   }
 
   function applyTheme(theme) {
@@ -343,6 +330,17 @@
     document.documentElement.setAttribute('data-theme', valid);
     localStorage.setItem('resenha_theme', valid);
     if (els.themeSelect) els.themeSelect.value = valid;
+  }
+
+  function updatePingBadge(ms) {
+    if (!els.pingBadge) return;
+    if (!ms) {
+      els.pingBadge.textContent = '-- ms';
+      els.pingBadge.className = 'ping-badge';
+      return;
+    }
+    els.pingBadge.textContent = `${ms} ms`;
+    els.pingBadge.className = 'ping-badge ' + (ms < 90 ? 'good' : ms < 190 ? 'warn' : 'bad');
   }
 
   function getInitials(name) {
@@ -408,7 +406,7 @@
     const url = `${window.location.origin}/sala/${encodeURIComponent(state.roomCode)}`;
     if (navigator.clipboard && navigator.clipboard.writeText) {
       navigator.clipboard.writeText(url).then(
-        () => showToast('Link de convite copiado! Mande pros amigos.', 'success'),
+        () => showToast('Link de convite copiado!', 'success'),
         () => fallbackCopy(url)
       );
     } else {
@@ -427,21 +425,22 @@
       document.execCommand('copy');
       showToast('Link de convite copiado!', 'success');
     } catch {
-      showToast(`Link: ${text}`, 'info');
+      showToast(`Copie o link: ${text}`, 'info');
     }
     ta.remove();
   }
 
-  // ==================== LOBBY INIT ====================
+  // ==================== LOBBY ====================
 
-  async function checkRoomSecurityHint(code) {
-    if (!code || code.length < 2) return;
+  async function checkLobbyRoomInfo(code) {
+    const clean = (code || '').trim();
+    if (clean.length < 2) return;
     try {
-      const res = await fetch(`/api/room-info/${encodeURIComponent(code)}`);
+      const res = await fetch(`/api/room-info/${encodeURIComponent(clean)}`);
       if (!res.ok) return;
       const info = await res.json();
       if (info.exists && info.hasPassword) {
-        els.roomPasswordLabel.textContent = '🔑 Esta sala exige senha';
+        els.roomPasswordLabel.textContent = '🔑 Senha obrigatória desta sala';
         els.roomPasswordInput.placeholder = 'Digite a senha da sala';
       } else {
         els.roomPasswordLabel.textContent = 'Senha da sala (opcional)';
@@ -487,29 +486,23 @@
       els.roomInput.value = urlRoom;
       els.inviteRoomLabel.textContent = urlRoom;
       els.inviteBanner.classList.remove('hidden');
-      checkRoomSecurityHint(urlRoom);
+      checkLobbyRoomInfo(urlRoom);
       els.nicknameInput.focus();
     } else {
       els.roomInput.value = generateRoomCode();
       els.nicknameInput.focus();
     }
 
-    els.roomInput.addEventListener('blur', () => {
-      checkRoomSecurityHint(els.roomInput.value.trim());
-    });
-
+    els.roomInput.addEventListener('blur', () => checkLobbyRoomInfo(els.roomInput.value));
     updateSoundToggleIcon();
-    updatePttBindLabel();
-    els.voiceModeSelect.value = state.voiceMode;
-    els.pttKeyBox.classList.toggle('hidden', state.voiceMode !== 'ptt');
-    els.soundboardVolSlider.value = String(Math.round(state.soundboardVol * 100));
-    els.soundboardVolLabel.textContent = `${Math.round(state.soundboardVol * 100)}%`;
+    updatePttUiControls();
   }
 
   els.generateRoomBtn.addEventListener('click', () => {
     els.roomInput.value = generateRoomCode();
-    els.inviteBanner.classList.add('hidden');
+    els.roomPasswordInput.value = '';
     els.roomPasswordLabel.textContent = 'Senha da sala (opcional)';
+    els.inviteBanner.classList.add('hidden');
   });
 
   els.joinForm.addEventListener('submit', (e) => {
@@ -532,13 +525,13 @@
         els.lobbyError.textContent = res?.error || 'Erro ao entrar na sala.';
         els.lobbyError.classList.remove('hidden');
         if (res?.code === 'PASSWORD_REQUIRED') {
-          els.roomPasswordLabel.textContent = '🔑 Esta sala exige senha';
+          els.roomPasswordLabel.textContent = '🔑 Senha obrigatória desta sala';
           els.roomPasswordInput.focus();
         }
         return;
       }
 
-      state.roomPasswordMemory = password;
+      state.lastEnteredPassword = password;
       localStorage.setItem('resenha_name', name);
       enterRoomUI(res);
     });
@@ -566,7 +559,7 @@
     els.lobbyView.classList.add('hidden');
     els.roomView.classList.remove('hidden');
 
-    renderRoomMetaUI();
+    updateRoomSecurityUI();
     renderMessagesFull(data.messages || []);
     renderMembers();
     updateVoiceDockUI();
@@ -577,7 +570,7 @@
     els.chatInput.focus();
   }
 
-  function leaveRoom() {
+  function leaveRoom(customReasonToast = null) {
     cancelVoiceRecording();
     voice.stopLatencyMonitor();
     voice.leaveVoice({ notifyServer: true });
@@ -587,7 +580,7 @@
     state.roomCode = null;
     state.self = null;
     state.users.clear();
-    state.messagesById.clear();
+    state.messagesMap.clear();
     state.speakingIds.clear();
     state.typingUsers.clear();
     state.activeScreenOwnerId = null;
@@ -598,22 +591,45 @@
     els.roomView.classList.add('hidden');
     els.lobbyView.classList.remove('hidden');
     closeMobileSidebar();
+
+    if (customReasonToast) {
+      showToast(customReasonToast, 'error');
+    }
   }
 
-  function renderRoomMetaUI() {
+  function updateRoomSecurityUI() {
+    const host = isSelfHost();
     els.roomLockIndicator.classList.toggle('hidden', !state.roomMeta.locked);
     els.roomPassIndicator.classList.toggle('hidden', !state.roomMeta.hasPassword);
-
-    const amHost = isHost();
-    els.lockRoomBtn.classList.toggle('hidden', !amHost);
+    els.lockRoomBtn.classList.toggle('hidden', !host);
     els.lockRoomBtn.classList.toggle('active', Boolean(state.roomMeta.locked));
     els.lockRoomBtn.title = state.roomMeta.locked
-      ? 'Sala trancada (clique para destrancar)'
-      : 'Trancar sala (impede novos acessos)';
-
-    els.selfRoleSub.textContent = amHost ? '👑 Anfitrião' : 'Online';
-    els.hostSecuritySection.classList.toggle('hidden', !amHost);
+      ? 'Sala trancada — clique para destrancar'
+      : 'Trancar sala (impede novas entradas)';
+    els.hostSecuritySection.classList.toggle('hidden', !host);
+    els.selfRoleSub.textContent = host ? '👑 Anfitrião' : 'Online';
   }
+
+  els.lockRoomBtn.addEventListener('click', () => {
+    if (!isSelfHost()) return;
+    socket.emit('room-set-lock', { locked: !state.roomMeta.locked }, (res) => {
+      if (res && !res.ok && res.error) showToast(res.error, 'error');
+    });
+  });
+
+  els.saveRoomPasswordBtn.addEventListener('click', () => {
+    if (!isSelfHost()) return;
+    const newPassword = els.hostPasswordInput.value.trim();
+    socket.emit('room-set-password', { password: newPassword }, (res) => {
+      if (res && res.ok) {
+        state.lastEnteredPassword = newPassword;
+        els.hostPasswordInput.value = '';
+        showToast(newPassword ? 'Senha da sala atualizada!' : 'Senha removida!', 'success');
+      } else if (res?.error) {
+        showToast(res.error, 'error');
+      }
+    });
+  });
 
   // ==================== SOCKET EVENTS ====================
 
@@ -621,7 +637,7 @@
     if (!user) return;
     state.users.set(user.id, user);
     if (roomMeta) state.roomMeta = roomMeta;
-    renderRoomMetaUI();
+    updateRoomSecurityUI();
     renderMembers();
     if (systemMessage) appendMessage(systemMessage);
     window.ResenhaSounds.playJoin();
@@ -632,7 +648,7 @@
     state.speakingIds.delete(userId);
     clearTypingUser(userId);
     if (roomMeta) state.roomMeta = roomMeta;
-    renderRoomMetaUI();
+    updateRoomSecurityUI();
     renderMembers();
     if (systemMessage) appendMessage(systemMessage);
     window.ResenhaSounds.playLeave();
@@ -640,14 +656,13 @@
 
   socket.on('room-meta-updated', ({ roomMeta, systemMessage }) => {
     if (roomMeta) state.roomMeta = roomMeta;
-    renderRoomMetaUI();
+    updateRoomSecurityUI();
     renderMembers();
     if (systemMessage) appendMessage(systemMessage);
   });
 
   socket.on('kicked-from-room', ({ reason }) => {
-    leaveRoom();
-    showToast(reason || 'Você foi removido da sala.', 'error');
+    leaveRoom(reason || 'Você foi removido da sala.');
   });
 
   socket.on('user-updated', (user) => {
@@ -679,15 +694,32 @@
 
   socket.on('chat-message-updated', (msg) => {
     if (!msg || !msg.id) return;
-    state.messagesById.set(msg.id, msg);
-    updateMessageDOM(msg);
+    state.messagesMap.set(msg.id, msg);
+    const existingRow = els.messagesList.querySelector(`[data-message-id="${CSS.escape(msg.id)}"]`);
+    if (existingRow) {
+      const wasGrouped = existingRow.classList.contains('grouped');
+      const freshRow = buildChatMessageElement(msg, wasGrouped);
+      existingRow.replaceWith(freshRow);
+    }
   });
 
   socket.on('chat-message-deleted', ({ messageId }) => {
     if (!messageId) return;
-    state.messagesById.delete(messageId);
-    const el = els.messagesList.querySelector(`[data-msg-id="${CSS.escape(messageId)}"]`);
-    if (el) el.remove();
+    state.messagesMap.delete(messageId);
+    const row = els.messagesList.querySelector(`[data-message-id="${CSS.escape(messageId)}"]`);
+    if (row) row.remove();
+  });
+
+  socket.on('soundboard-play', ({ fromName, soundId, soundName, customAudio }) => {
+    if (!voice.inVoice) return;
+    window.ResenhaSounds.playSoundboard(soundId, customAudio, voice.deafened);
+    showToast(`🔊 ${fromName} tocou: ${soundName}`, 'info');
+  });
+
+  socket.on('screen-ping', ({ fromName, fromColor, targetOwnerId, x, y }) => {
+    if (targetOwnerId !== state.activeScreenOwnerId || state.stageHiddenByUser) return;
+    renderScreenPingMarker(fromName, fromColor, x, y);
+    window.ResenhaSounds.playPing();
   });
 
   socket.on('user-typing', ({ userId, name, isTyping }) => {
@@ -701,16 +733,6 @@
       clearTypingUser(userId);
     }
     renderTypingIndicator();
-  });
-
-  socket.on('soundboard-play', ({ fromName, soundId, soundName, customAudio }) => {
-    if (!voice.inVoice) return;
-    window.ResenhaSounds.playSoundboard(soundId, customAudio, voice.deafened);
-    showToast(`🔊 ${fromName} tocou: ${soundName}`, 'info');
-  });
-
-  socket.on('screen-ping', (payload) => {
-    renderIncomingScreenPing(payload);
   });
 
   socket.on('disconnect', (reason) => {
@@ -731,59 +753,25 @@
           name: state.self.name,
           roomCode: state.roomCode,
           color: state.self.color,
-          password: state.roomPasswordMemory,
+          password: state.lastEnteredPassword,
         },
         async (res) => {
           if (res && res.ok) {
             enterRoomUI(res);
             showToast('Reconectado à sala!', 'success');
-            if (wasInVoice) {
-              await handleJoinVoice(wasListenOnly);
-            }
+            if (wasInVoice) await handleJoinVoice(wasListenOnly);
           }
         }
       );
     }
   });
 
-  // ==================== MODERAÇÃO (LOCK, SENHA, KICK) ====================
-
-  els.lockRoomBtn.addEventListener('click', () => {
-    if (!isHost()) return;
-    socket.emit('room-set-lock', { locked: !state.roomMeta.locked }, (res) => {
-      if (res && !res.ok && res.error) showToast(res.error, 'error');
-    });
-  });
-
-  els.saveRoomPasswordBtn.addEventListener('click', () => {
-    if (!isHost()) return;
-    const newPass = els.hostPasswordInput.value.trim();
-    socket.emit('room-set-password', { password: newPass }, (res) => {
-      if (res && res.ok) {
-        state.roomPasswordMemory = newPass;
-        els.hostPasswordInput.value = '';
-        showToast(newPass ? 'Senha da sala atualizada!' : 'Senha da sala removida!', 'success');
-      } else if (res?.error) {
-        showToast(res.error, 'error');
-      }
-    });
-  });
-
-  function kickMember(user) {
-    if (!isHost() || !user) return;
-    if (!window.confirm(`Remover "${user.name}" da sala?`)) return;
-    socket.emit('kick-user', { targetId: user.id }, (res) => {
-      if (res && res.ok) showToast(`${user.name} foi removido da sala.`, 'info');
-      else if (res?.error) showToast(res.error, 'error');
-    });
-  }
-
   // ==================== MEMBROS E VOZ UI ====================
 
   function renderMembers() {
     const allUsers = Array.from(state.users.values()).sort((a, b) => a.joinedAt - b.joinedAt);
     const voiceUsers = allUsers.filter((u) => u.inVoice);
-    const amHost = isHost();
+    const amHost = isSelfHost();
 
     els.onlineCount.textContent = `${allUsers.length} online`;
     els.voiceCountBadge.textContent = String(voiceUsers.length);
@@ -792,7 +780,7 @@
     els.voiceMembersList.innerHTML = '';
     voiceUsers.forEach((u) => {
       const isSelf = state.self && u.id === state.self.id;
-      const uIsHost = state.roomMeta.hostId === u.id;
+      const isHost = state.roomMeta.hostId === u.id;
       const li = document.createElement('li');
       li.className = 'member-item';
 
@@ -809,7 +797,7 @@
       nameWrap.className = 'member-name-wrap';
       const nameEl = document.createElement('div');
       nameEl.className = 'member-name';
-      if (uIsHost) {
+      if (isHost) {
         const crown = document.createElement('span');
         crown.className = 'host-crown';
         crown.textContent = '👑';
@@ -827,14 +815,6 @@
 
       const badges = document.createElement('div');
       badges.className = 'member-badges';
-
-      if (u.cameraOn) {
-        const camIcon = document.createElement('span');
-        camIcon.className = 'status-icon';
-        camIcon.title = 'Webcam ligada';
-        camIcon.textContent = '📷';
-        badges.appendChild(camIcon);
-      }
 
       if (u.screenSharing) {
         const liveBtn = document.createElement('button');
@@ -920,11 +900,10 @@
       els.voiceMembersList.appendChild(li);
     });
 
-    // Lista de todos os membros online
     els.allMembersList.innerHTML = '';
     allUsers.forEach((u) => {
       const isSelf = state.self && u.id === state.self.id;
-      const uIsHost = state.roomMeta.hostId === u.id;
+      const isHost = state.roomMeta.hostId === u.id;
       const li = document.createElement('li');
       li.className = 'member-item';
 
@@ -940,7 +919,7 @@
       nameWrap.className = 'member-name-wrap';
       const nameEl = document.createElement('div');
       nameEl.className = 'member-name';
-      if (uIsHost) {
+      if (isHost) {
         const crown = document.createElement('span');
         crown.className = 'host-crown';
         crown.textContent = '👑';
@@ -964,7 +943,12 @@
         kickBtn.className = 'kick-btn';
         kickBtn.textContent = '✕';
         kickBtn.title = `Remover ${u.name} da sala`;
-        kickBtn.addEventListener('click', () => kickMember(u));
+        kickBtn.addEventListener('click', () => {
+          if (!confirm(`Remover "${u.name}" da sala?`)) return;
+          socket.emit('kick-user', { targetId: u.id }, (res) => {
+            if (res && res.ok) showToast(`${u.name} foi removido.`, 'info');
+          });
+        });
         row.appendChild(kickBtn);
       }
 
@@ -993,8 +977,7 @@
   function updateSpeakingIndicators(userId, isSpeaking) {
     const avatars = els.voiceMembersList.querySelectorAll(`[data-avatar-user-id="${CSS.escape(userId)}"]`);
     avatars.forEach((el) => el.classList.toggle('speaking', isSpeaking));
-
-    const camCards = els.cameraStrip.querySelectorAll(`[data-cam-card="${CSS.escape(userId)}"]`);
+    const camCards = els.cameraStrip.querySelectorAll(`[data-cam-card-id="${CSS.escape(userId)}"]`);
     camCards.forEach((el) => el.classList.toggle('speaking', isSpeaking));
   }
 
@@ -1015,10 +998,10 @@
       els.voiceStatusTitle.textContent = 'Só ouvindo';
       els.voiceStatusSub.textContent = 'Clique em Mic para falar';
     } else if (voice.pttEnabled) {
-      els.voiceStatusTitle.textContent = 'Push-to-Talk';
-      els.voiceStatusSub.textContent = voice.pttPressed
-        ? '🟢 Transmitindo voz...'
-        : `Segure [${state.pttKeyLabel}] p/ falar`;
+      els.voiceStatusTitle.textContent = voice.muted ? 'Push-to-Talk' : 'Transmitindo voz!';
+      els.voiceStatusSub.textContent = voice.muted
+        ? `Segure [${state.pttKeyLabel}] para falar`
+        : 'Microfone aberto';
     } else if (voice.muted) {
       els.voiceStatusTitle.textContent = 'Voz conectada';
       els.voiceStatusSub.textContent = 'Microfone silenciado';
@@ -1038,13 +1021,13 @@
     els.deafenBtn.querySelector('.icon-off').classList.toggle('hidden', !voice.deafened);
 
     els.camBtn.classList.toggle('live-active', voice.cameraOn);
-    els.camBtnLabel.textContent = voice.cameraOn ? 'Câm ON' : 'Câmera';
+    els.camBtnLabel.textContent = voice.cameraOn ? 'Cam ON' : 'Câmera';
 
     els.screenBtn.classList.toggle('live-active', voice.screenSharing);
     els.screenBtnLabel.textContent = voice.screenSharing ? 'Parar' : 'Tela';
   }
 
-  // ==================== FAIXA DE WEBCAMS ====================
+  // ==================== WEBCAM STRIP ====================
 
   function renderCameraStrip() {
     const cams = voice.getActiveCameras();
@@ -1055,29 +1038,38 @@
     }
 
     els.cameraStrip.classList.remove('hidden');
-    const wantedIds = new Set(cams.map((c) => c.ownerId));
 
-    // Remove cartões de câmeras desligadas
-    els.cameraStrip.querySelectorAll('[data-cam-card]').forEach((card) => {
-      if (!wantedIds.has(card.dataset.camCard)) card.remove();
+    const activeIds = new Set(cams.map((c) => c.ownerId));
+    // Remove cartões antigos
+    Array.from(els.cameraStrip.children).forEach((child) => {
+      if (!activeIds.has(child.dataset.camCardId)) {
+        child.remove();
+      }
     });
 
     cams.forEach((c) => {
       const owner = state.users.get(c.ownerId);
       const name = c.isSelf ? 'Você' : owner ? owner.name : 'Amigo';
-      let card = els.cameraStrip.querySelector(`[data-cam-card="${CSS.escape(c.ownerId)}"]`);
-      const modeTag = c.isRelay ? 'relay' : 'webrtc';
+      let card = els.cameraStrip.querySelector(`[data-cam-card-id="${CSS.escape(c.ownerId)}"]`);
+      const modeKey = c.isRelay ? 'relay' : 'stream';
 
-      if (!card || card.dataset.mode !== modeTag) {
-        if (card) card.remove();
+      if (card && card.dataset.camMode !== modeKey) {
+        card.remove();
+        card = null;
+      }
+
+      if (!card) {
         card = document.createElement('div');
-        card.className = 'cam-card' + (c.isSelf ? ' self-cam' : '') + (state.speakingIds.has(c.ownerId) ? ' speaking' : '');
-        card.dataset.camCard = c.ownerId;
-        card.dataset.mode = modeTag;
+        card.className =
+          'cam-card' +
+          (c.isSelf ? ' self-cam' : '') +
+          (state.speakingIds.has(c.ownerId) ? ' speaking' : '');
+        card.dataset.camCardId = c.ownerId;
+        card.dataset.camMode = modeKey;
 
         if (c.isRelay) {
           const canvas = document.createElement('canvas');
-          canvas.dataset.camOwner = c.ownerId;
+          canvas.dataset.camCanvas = c.ownerId;
           card.appendChild(canvas);
         } else {
           const vid = document.createElement('video');
@@ -1093,7 +1085,6 @@
         label.className = 'cam-label';
         label.textContent = name;
         card.appendChild(label);
-
         els.cameraStrip.appendChild(card);
       } else if (!c.isRelay) {
         const vid = card.querySelector('video');
@@ -1119,6 +1110,7 @@
       els.stageVideo.srcObject = null;
       els.stageVideo.classList.remove('hidden');
       els.stageCanvas.classList.add('hidden');
+      els.screenPingsLayer.innerHTML = '';
       return;
     }
 
@@ -1197,7 +1189,7 @@
     }
   }
 
-  // Calcula caixa exata da imagem dentro do container (object-fit: contain)
+  // Calcula caixa exata da imagem dentro do object-fit:contain para o ping cair no pixel certo
   function getStageContentBox() {
     const wrapRect = els.stageVideoWrap.getBoundingClientRect();
     const isCanvas = !els.stageCanvas.classList.contains('hidden');
@@ -1210,21 +1202,22 @@
 
     const wrapRatio = wrapRect.width / wrapRect.height;
     const mediaRatio = mediaW / mediaH;
-    let width, height, left, top;
-
+    let width;
+    let height;
     if (mediaRatio > wrapRatio) {
       width = wrapRect.width;
       height = wrapRect.width / mediaRatio;
-      left = 0;
-      top = (wrapRect.height - height) / 2;
     } else {
       height = wrapRect.height;
       width = wrapRect.height * mediaRatio;
-      top = 0;
-      left = (wrapRect.width - width) / 2;
     }
-
-    return { left, top, width, height, wrapRect };
+    return {
+      left: (wrapRect.width - width) / 2,
+      top: (wrapRect.height - height) / 2,
+      width,
+      height,
+      wrapRect,
+    };
   }
 
   els.stageVideoWrap.addEventListener('click', (e) => {
@@ -1232,36 +1225,36 @@
     const box = getStageContentBox();
     if (!box.width || !box.height) return;
 
-    const relX = (e.clientX - box.wrapRect.left - box.left) / box.width;
-    const relY = (e.clientY - box.wrapRect.top - box.top) / box.height;
-    if (relX < 0 || relX > 1 || relY < 0 || relY > 1) return;
+    const clickX = e.clientX - box.wrapRect.left - box.left;
+    const clickY = e.clientY - box.wrapRect.top - box.top;
+    if (clickX < 0 || clickY < 0 || clickX > box.width || clickY > box.height) return;
+
+    const x = Math.max(0, Math.min(1, clickX / box.width));
+    const y = Math.max(0, Math.min(1, clickY / box.height));
 
     socket.emit('screen-ping', {
       targetOwnerId: state.activeScreenOwnerId,
-      x: Number(relX.toFixed(4)),
-      y: Number(relY.toFixed(4)),
+      x,
+      y,
     });
   });
 
-  function renderIncomingScreenPing({ fromName, fromColor, targetOwnerId, x, y }) {
-    if (!state.activeScreenOwnerId || targetOwnerId !== state.activeScreenOwnerId || state.stageHiddenByUser) return;
+  function renderScreenPingMarker(name, color, xPct, yPct) {
     const box = getStageContentBox();
     if (!box.width || !box.height) return;
 
-    window.ResenhaSounds.playPing();
-
     const marker = document.createElement('div');
     marker.className = 'screen-ping-marker';
-    marker.style.left = `${box.left + x * box.width}px`;
-    marker.style.top = `${box.top + y * box.height}px`;
-    marker.style.setProperty('--ping-color', fromColor || '#5865F2');
+    marker.style.left = `${box.left + xPct * box.width}px`;
+    marker.style.top = `${box.top + yPct * box.height}px`;
+    marker.style.setProperty('--ping-color', color || '#5865F2');
 
     const ring = document.createElement('div');
     ring.className = 'screen-ping-ring';
 
     const label = document.createElement('div');
     label.className = 'screen-ping-label';
-    label.textContent = fromName || 'Aqui!';
+    label.textContent = name;
 
     marker.appendChild(ring);
     marker.appendChild(label);
@@ -1270,7 +1263,7 @@
     setTimeout(() => marker.remove(), 1550);
   }
 
-  // ==================== CONTROLES DE VOZ, WEBCAM & TELA ====================
+  // ==================== CONTROLES DE VOZ, WEBCAM E TELA ====================
 
   async function handleJoinVoice(listenOnly) {
     els.joinVoiceBtn.disabled = true;
@@ -1303,17 +1296,6 @@
   });
 
   els.muteBtn.addEventListener('click', async () => {
-    if (voice.pttEnabled && !voice.listenOnly) {
-      // Se estava em Push-to-Talk e clicou no Mic, volta para Voz Livre rapidamente
-      state.voiceMode = 'auto';
-      localStorage.setItem('resenha_voice_mode', 'auto');
-      els.voiceModeSelect.value = 'auto';
-      els.pttKeyBox.classList.add('hidden');
-      voice.setPttMode(false);
-      showToast('Modo Voz Livre ativado!', 'info');
-      renderMembers();
-      return;
-    }
     const res = await voice.toggleMute();
     if (res && !res.ok && res.error) {
       showToast(res.error, 'error');
@@ -1332,13 +1314,12 @@
 
   els.camBtn.addEventListener('click', async () => {
     const res = await voice.toggleCamera();
-    if (!res.ok && res.error) {
+    if (res && !res.ok && res.error) {
       showToast(res.error, 'error');
       return;
     }
-    window.ResenhaSounds.playClick(Boolean(res.cameraOn));
     renderCameraStrip();
-    renderMembers();
+    showToast(voice.cameraOn ? 'Webcam ligada!' : 'Webcam desligada.', 'info');
   });
 
   els.screenBtn.addEventListener('click', async () => {
@@ -1373,13 +1354,13 @@
         await els.stageVideo.requestPictureInPicture();
       }
     } catch {
-      showToast('Picture-in-Picture indisponível para esta transmissão.', 'info');
+      showToast('Não foi possível abrir Picture-in-Picture.', 'error');
     }
   });
 
   els.fullscreenBtn.addEventListener('click', () => {
     if (!document.fullscreenElement) {
-      els.stageVideoWrap.requestFullscreen?.();
+      (els.stageVideoWrap.requestFullscreen || els.stageVideo.requestFullscreen)?.call(els.stageVideoWrap);
     } else {
       document.exitFullscreen?.();
     }
@@ -1397,22 +1378,22 @@
 
   // ==================== SOUNDBOARD ====================
 
-  function renderSoundboardGrid() {
+  function renderSoundboardPads() {
     els.soundboardGrid.innerHTML = '';
 
-    window.ResenhaSounds.builtinList.forEach((item) => {
-      const pad = document.createElement('button');
-      pad.type = 'button';
-      pad.className = 'sound-pad';
-      pad.innerHTML = `<span class="sound-pad-emoji">${item.emoji}</span><span class="sound-pad-name">${escapeHtml(item.name)}</span>`;
-      pad.addEventListener('click', () => triggerSoundboard({ soundId: item.id, soundName: item.name }));
-      els.soundboardGrid.appendChild(pad);
+    window.ResenhaSounds.builtinList.forEach((s) => {
+      const btn = document.createElement('button');
+      btn.type = 'button';
+      btn.className = 'sound-pad';
+      btn.innerHTML = `<span class="sound-pad-emoji">${s.emoji}</span><span class="sound-pad-name">${escapeHtml(s.name)}</span>`;
+      btn.addEventListener('click', () => triggerSoundboard(s.id, `${s.emoji} ${s.name}`, null));
+      els.soundboardGrid.appendChild(btn);
     });
 
-    state.customSounds.forEach((custom, idx) => {
-      const pad = document.createElement('button');
-      pad.type = 'button';
-      pad.className = 'sound-pad';
+    state.customSounds.forEach((cs, idx) => {
+      const btn = document.createElement('button');
+      btn.type = 'button';
+      btn.className = 'sound-pad';
 
       const em = document.createElement('span');
       em.className = 'sound-pad-emoji';
@@ -1420,51 +1401,51 @@
 
       const nm = document.createElement('span');
       nm.className = 'sound-pad-name';
-      nm.textContent = custom.name;
+      nm.textContent = cs.name;
 
-      const del = document.createElement('button');
-      del.type = 'button';
+      const del = document.createElement('span');
       del.className = 'sound-pad-del';
-      del.textContent = '✕';
-      del.title = 'Remover áudio';
-      del.addEventListener('click', (ev) => {
-        ev.stopPropagation();
+      del.textContent = '×';
+      del.title = 'Apagar som';
+      del.addEventListener('click', (e) => {
+        e.stopPropagation();
         state.customSounds.splice(idx, 1);
         saveCustomSounds();
-        renderSoundboardGrid();
+        renderSoundboardPads();
       });
 
-      pad.appendChild(em);
-      pad.appendChild(nm);
-      pad.appendChild(del);
-      pad.addEventListener('click', () =>
-        triggerSoundboard({ soundId: 'custom', soundName: custom.name, customAudio: custom.dataUrl })
-      );
-      els.soundboardGrid.appendChild(pad);
+      btn.appendChild(em);
+      btn.appendChild(nm);
+      btn.appendChild(del);
+      btn.addEventListener('click', () => triggerSoundboard('', `🎵 ${cs.name}`, cs.dataUrl));
+      els.soundboardGrid.appendChild(btn);
     });
   }
 
-  function triggerSoundboard(payload) {
-    socket.emit('soundboard-play', payload, (res) => {
+  function triggerSoundboard(soundId, soundName, customAudio) {
+    socket.emit('soundboard-play', { soundId, soundName, customAudio }, (res) => {
       if (res && !res.ok && res.error) showToast(res.error, 'error');
     });
   }
 
   els.soundboardBtn.addEventListener('click', () => {
-    renderSoundboardGrid();
+    els.soundboardVolSlider.value = String(Math.round(state.soundboardVolume * 100));
+    els.soundboardVolLabel.textContent = `${Math.round(state.soundboardVolume * 100)}%`;
+    renderSoundboardPads();
     els.soundboardModal.classList.remove('hidden');
   });
+
   els.closeSoundboardBtn.addEventListener('click', () => els.soundboardModal.classList.add('hidden'));
   els.soundboardModal.addEventListener('click', (e) => {
     if (e.target === els.soundboardModal) els.soundboardModal.classList.add('hidden');
   });
 
   els.soundboardVolSlider.addEventListener('input', () => {
-    const val = Number(els.soundboardVolSlider.value);
-    state.soundboardVol = val / 100;
-    window.ResenhaSounds.soundboardVolume = state.soundboardVol;
-    els.soundboardVolLabel.textContent = `${val}%`;
-    localStorage.setItem('resenha_sb_vol', String(val));
+    const pct = Number(els.soundboardVolSlider.value);
+    els.soundboardVolLabel.textContent = `${pct}%`;
+    state.soundboardVolume = pct / 100;
+    window.ResenhaSounds.soundboardVolume = state.soundboardVolume;
+    localStorage.setItem('resenha_sb_vol', String(pct));
   });
 
   els.addCustomSoundBtn.addEventListener('click', () => els.customSoundInput.click());
@@ -1476,16 +1457,16 @@
       showToast('Escolha um áudio curto de até 650 KB!', 'error');
       return;
     }
-    const cleanName = file.name.replace(/\.[^.]+$/, '').slice(0, 24) || 'Meu Áudio';
+    if (state.customSounds.length >= 6) {
+      showToast('Limite de 6 áudios personalizados atingido. Apague um antes.', 'error');
+      return;
+    }
+    const cleanName = file.name.replace(/\.[^.]+$/, '').slice(0, 22) || 'Meu Áudio';
     const reader = new FileReader();
     reader.onload = () => {
-      if (state.customSounds.length >= 8) {
-        showToast('Limite de 8 áudios customizados atingido.', 'error');
-        return;
-      }
       state.customSounds.push({ name: cleanName, dataUrl: reader.result });
       saveCustomSounds();
-      renderSoundboardGrid();
+      renderSoundboardPads();
       showToast(`"${cleanName}" adicionado à Mesa de Sons!`, 'success');
     };
     reader.readAsDataURL(file);
@@ -1503,14 +1484,14 @@
 
   function renderMessagesFull(messages) {
     els.messagesList.innerHTML = '';
-    state.messagesById.clear();
+    state.messagesMap.clear();
     state.lastMessageMeta = null;
 
     const welcome = document.createElement('div');
     welcome.className = 'welcome-card';
     welcome.innerHTML = `
       <h3>Bem-vindo à sala #${escapeHtml(state.roomCode)}</h3>
-      <p>Converse, reaja às mensagens, mande áudios ou prints com <strong>Ctrl + V</strong>, ligue a webcam ou aponte clicando na tela transmitida!</p>
+      <p>Converse por aqui, reaja com emojis, envie áudios 🎤, cole prints com <strong>Ctrl + V</strong> ou entre na voz para ligar tela 4K, webcam e soundboard!</p>
     `;
     els.messagesList.appendChild(welcome);
 
@@ -1518,60 +1499,16 @@
     scrollChatToBottom(true);
   }
 
-  function appendMessage(msg, { autoScroll = true } = {}) {
-    const isNearBottom =
-      els.messagesList.scrollHeight - els.messagesList.scrollTop - els.messagesList.clientHeight < 150;
-
-    if (msg.type === 'system') {
-      const sys = document.createElement('div');
-      sys.className = 'msg-system';
-      sys.textContent = msg.text;
-      els.messagesList.appendChild(sys);
-      state.lastMessageMeta = null;
-    } else {
-      state.messagesById.set(msg.id, msg);
-      const canGroup =
-        !msg.replyTo &&
-        state.lastMessageMeta &&
-        state.lastMessageMeta.senderId === msg.senderId &&
-        msg.timestamp - state.lastMessageMeta.timestamp < 5 * 60 * 1000;
-
-      const row = buildChatMessageElement(msg, canGroup);
-      els.messagesList.appendChild(row);
-
-      state.lastMessageMeta = {
-        senderId: msg.senderId,
-        timestamp: msg.timestamp,
-      };
-    }
-
-    if (autoScroll && (isNearBottom || msg.senderId === state.self?.id)) {
-      scrollChatToBottom(false);
-    }
-  }
-
-  function buildChatMessageElement(msg, grouped) {
+  function buildChatMessageElement(msg, isGrouped) {
+    const canGroup = isGrouped && !msg.replyTo;
     const row = document.createElement('div');
-    row.className = 'msg-row' + (grouped ? ' grouped' : '');
-    row.dataset.msgId = msg.id;
-    row.dataset.grouped = grouped ? '1' : '0';
-    populateChatMessageInner(row, msg, grouped);
-    return row;
-  }
-
-  function updateMessageDOM(msg) {
-    const row = els.messagesList.querySelector(`[data-msg-id="${CSS.escape(msg.id)}"]`);
-    if (!row) return;
-    const grouped = row.dataset.grouped === '1';
-    populateChatMessageInner(row, msg, grouped);
-  }
-
-  function populateChatMessageInner(row, msg, grouped) {
-    row.innerHTML = '';
+    row.className = 'msg-row' + (canGroup ? ' grouped' : '');
+    row.dataset.messageId = msg.id;
 
     const gutter = document.createElement('div');
     gutter.className = 'msg-gutter';
-    if (grouped) {
+
+    if (canGroup) {
       const hoverTime = document.createElement('span');
       hoverTime.className = 'msg-hover-time';
       hoverTime.textContent = formatTime(msg.timestamp);
@@ -1594,14 +1531,14 @@
       qAuthor.style.color = msg.replyTo.senderColor || '#a5adc2';
       qAuthor.textContent = `@${msg.replyTo.senderName}`;
       const qText = document.createElement('span');
-      qText.textContent = msg.replyTo.preview || '';
+      qText.textContent = msg.replyTo.preview || 'Mensagem';
       quote.appendChild(qAuthor);
       quote.appendChild(qText);
       quote.addEventListener('click', () => scrollToMessage(msg.replyTo.id));
       body.appendChild(quote);
     }
 
-    if (!grouped) {
+    if (!canGroup) {
       const header = document.createElement('div');
       header.className = 'msg-header';
 
@@ -1636,19 +1573,19 @@
       const img = document.createElement('img');
       img.className = 'msg-image';
       img.src = msg.image;
-      img.alt = `Imagem de ${msg.senderName}`;
+      img.alt = `Imagem enviada por ${msg.senderName}`;
       img.loading = 'lazy';
       img.addEventListener('click', () => openLightbox(msg.image));
       body.appendChild(img);
     }
 
     if (msg.audio) {
-      const audioEl = document.createElement('audio');
-      audioEl.className = 'msg-audio-player';
-      audioEl.controls = true;
-      audioEl.preload = 'metadata';
-      audioEl.src = msg.audio;
-      body.appendChild(audioEl);
+      const aud = document.createElement('audio');
+      aud.className = 'msg-audio-player';
+      aud.controls = true;
+      aud.preload = 'metadata';
+      aud.src = msg.audio;
+      body.appendChild(aud);
     }
 
     // Reações existentes
@@ -1658,10 +1595,10 @@
       reactWrap.className = 'msg-reactions';
       reactionEntries.forEach(([emoji, users]) => {
         if (!Array.isArray(users) || users.length === 0) return;
-        const isMine = users.some((u) => u.id === state.self?.id);
+        const mine = users.some((u) => u.id === state.self?.id);
         const chip = document.createElement('button');
         chip.type = 'button';
-        chip.className = 'reaction-chip' + (isMine ? ' mine' : '');
+        chip.className = 'reaction-chip' + (mine ? ' mine' : '');
         chip.title = users.map((u) => u.name).join(', ');
         chip.textContent = `${emoji} ${users.length}`;
         chip.addEventListener('click', () => {
@@ -1672,18 +1609,18 @@
       body.appendChild(reactWrap);
     }
 
-    // Barra flutuante de ações (Reagir, Responder, Editar, Apagar)
+    // Barra flutuante de ações ao passar o mouse
     const actions = document.createElement('div');
     actions.className = 'msg-actions-bar';
 
-    QUICK_REACTIONS.forEach((em) => {
-      const rb = document.createElement('button');
-      rb.type = 'button';
-      rb.className = 'msg-act-btn';
-      rb.textContent = em;
-      rb.title = `Reagir com ${em}`;
-      rb.addEventListener('click', () => socket.emit('chat-react', { messageId: msg.id, emoji: em }));
-      actions.appendChild(rb);
+    REACTION_BAR_EMOJIS.forEach((em) => {
+      const b = document.createElement('button');
+      b.type = 'button';
+      b.className = 'msg-act-btn';
+      b.textContent = em;
+      b.title = `Reagir com ${em}`;
+      b.addEventListener('click', () => socket.emit('chat-react', { messageId: msg.id, emoji: em }));
+      actions.appendChild(b);
     });
 
     const replyBtn = document.createElement('button');
@@ -1691,7 +1628,7 @@
     replyBtn.className = 'msg-act-btn';
     replyBtn.textContent = '↩';
     replyBtn.title = 'Responder';
-    replyBtn.addEventListener('click', () => startReplyTo(msg));
+    replyBtn.addEventListener('click', () => startReplyToMessage(msg));
     actions.appendChild(replyBtn);
 
     const isMine = state.self && msg.senderId === state.self.id;
@@ -1705,7 +1642,7 @@
       actions.appendChild(editBtn);
     }
 
-    if (isMine || isHost()) {
+    if (isMine || isSelfHost()) {
       const delBtn = document.createElement('button');
       delBtn.type = 'button';
       delBtn.className = 'msg-act-btn danger';
@@ -1720,31 +1657,62 @@
     row.appendChild(gutter);
     row.appendChild(body);
     row.appendChild(actions);
+    return row;
   }
 
-  function scrollToMessage(msgId) {
-    const target = els.messagesList.querySelector(`[data-msg-id="${CSS.escape(msgId)}"]`);
-    if (!target) {
-      showToast('Mensagem original não está mais no histórico recente.', 'info');
-      return;
+  function appendMessage(msg, { autoScroll = true } = {}) {
+    const isNearBottom =
+      els.messagesList.scrollHeight - els.messagesList.scrollTop - els.messagesList.clientHeight < 140;
+
+    if (msg.type === 'system') {
+      const sys = document.createElement('div');
+      sys.className = 'msg-system';
+      sys.textContent = msg.text;
+      els.messagesList.appendChild(sys);
+      state.lastMessageMeta = null;
+    } else {
+      state.messagesMap.set(msg.id, msg);
+      const canGroup =
+        !msg.replyTo &&
+        state.lastMessageMeta &&
+        state.lastMessageMeta.senderId === msg.senderId &&
+        msg.timestamp - state.lastMessageMeta.timestamp < 5 * 60 * 1000;
+
+      const row = buildChatMessageElement(msg, Boolean(canGroup));
+      els.messagesList.appendChild(row);
+
+      state.lastMessageMeta = {
+        senderId: msg.senderId,
+        timestamp: msg.timestamp,
+      };
     }
+
+    if (autoScroll && (isNearBottom || msg.senderId === state.self?.id)) {
+      scrollChatToBottom(false);
+    }
+  }
+
+  function scrollToMessage(messageId) {
+    const target = els.messagesList.querySelector(`[data-message-id="${CSS.escape(messageId)}"]`);
+    if (!target) return;
     target.scrollIntoView({ behavior: 'smooth', block: 'center' });
     target.classList.add('highlight-flash');
-    setTimeout(() => target.classList.remove('highlight-flash'), 1400);
+    setTimeout(() => target.classList.remove('highlight-flash'), 1200);
   }
 
-  function startReplyTo(msg) {
-    state.editingMessageId = null;
-    state.replyingToId = msg.id;
-    els.composerContextText.textContent = `Respondendo a ${msg.senderName}: "${(msg.text || 'mídia').slice(0, 50)}"`;
+  function startReplyToMessage(msg) {
+    state.editingMsgId = null;
+    state.replyingToMsg = msg;
+    const preview = msg.text || (msg.image ? '📷 Imagem' : '🎤 Mensagem de voz');
+    els.composerContextText.textContent = `↩ Respondendo a ${msg.senderName}: ${preview.slice(0, 60)}`;
     els.composerContextBar.classList.remove('hidden');
     els.chatInput.focus();
   }
 
   function startEditMessage(msg) {
-    state.replyingToId = null;
-    state.editingMessageId = msg.id;
-    els.composerContextText.textContent = '✏️ Editando sua mensagem (Enter salva • Esc cancela)';
+    state.replyingToMsg = null;
+    state.editingMsgId = msg.id;
+    els.composerContextText.textContent = '✏️ Editando sua mensagem (Esc para cancelar)';
     els.composerContextBar.classList.remove('hidden');
     els.chatInput.value = msg.text || '';
     autoResizeTextarea();
@@ -1752,13 +1720,14 @@
   }
 
   function clearComposerContext() {
-    if (state.editingMessageId) {
+    const wasEditing = Boolean(state.editingMsgId);
+    state.replyingToMsg = null;
+    state.editingMsgId = null;
+    els.composerContextBar.classList.add('hidden');
+    if (wasEditing) {
       els.chatInput.value = '';
       autoResizeTextarea();
     }
-    state.replyingToId = null;
-    state.editingMessageId = null;
-    els.composerContextBar.classList.add('hidden');
   }
 
   els.cancelContextBtn.addEventListener('click', clearComposerContext);
@@ -1796,90 +1765,97 @@
     }
   }
 
-  // ==================== GRAVAÇÃO DE MENSAGEM DE VOZ NO CHAT ====================
+  // ==================== GRAVADOR DE MENSAGEM DE VOZ NO CHAT ====================
 
-  let chatRecorder = null;
-  let chatRecStream = null;
-  let chatRecChunks = [];
-  let chatRecTimer = null;
-  let chatRecSeconds = 0;
+  let voiceRecorder = null;
+  let voiceRecChunks = [];
+  let voiceRecStream = null;
+  let voiceRecTimerId = null;
+  let voiceRecStartAt = 0;
+
+  function getSupportedAudioMime() {
+    if (typeof MediaRecorder === 'undefined') return '';
+    const candidates = ['audio/webm;codecs=opus', 'audio/webm', 'audio/ogg;codecs=opus', 'audio/mp4'];
+    for (const mime of candidates) {
+      if (!MediaRecorder.isTypeSupported || MediaRecorder.isTypeSupported(mime)) return mime;
+    }
+    return '';
+  }
 
   async function startVoiceRecording() {
-    if (chatRecorder) return;
+    if (voiceRecorder) return;
     if (!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia || typeof MediaRecorder === 'undefined') {
-      showToast('Seu navegador não suporta gravação de áudio.', 'error');
+      showToast('Seu navegador não suporta gravação de mensagem de voz.', 'error');
       return;
     }
 
     try {
-      chatRecStream = await navigator.mediaDevices.getUserMedia({ audio: true });
+      voiceRecStream = await navigator.mediaDevices.getUserMedia({ audio: true, video: false });
     } catch {
-      showToast('Permita o acesso ao microfone para gravar áudio.', 'error');
+      showToast('Permita o microfone para gravar mensagem de voz.', 'error');
       return;
     }
 
-    const mimeCandidates = ['audio/webm;codecs=opus', 'audio/webm', 'audio/ogg;codecs=opus', 'audio/mp4'];
-    const mimeType = mimeCandidates.find((m) => MediaRecorder.isTypeSupported(m)) || '';
+    const mimeType = getSupportedAudioMime();
+    voiceRecChunks = [];
+    voiceRecorder = mimeType ? new MediaRecorder(voiceRecStream, { mimeType }) : new MediaRecorder(voiceRecStream);
 
-    chatRecChunks = [];
-    chatRecorder = mimeType ? new MediaRecorder(chatRecStream, { mimeType }) : new MediaRecorder(chatRecStream);
-
-    chatRecorder.ondataavailable = (ev) => {
-      if (ev.data && ev.data.size > 0) chatRecChunks.push(ev.data);
+    voiceRecorder.ondataavailable = (ev) => {
+      if (ev.data && ev.data.size > 0) voiceRecChunks.push(ev.data);
     };
 
-    chatRecorder.start();
-    chatRecSeconds = 0;
+    voiceRecorder.start(200);
+    voiceRecStartAt = Date.now();
     els.voiceRecTimer.textContent = 'Gravando 0:00';
     els.voiceRecBar.classList.remove('hidden');
 
-    chatRecTimer = setInterval(() => {
-      chatRecSeconds += 1;
-      const mins = Math.floor(chatRecSeconds / 60);
-      const secs = String(chatRecSeconds % 60).padStart(2, '0');
-      els.voiceRecTimer.textContent = `Gravando ${mins}:${secs}`;
-      if (chatRecSeconds >= 60) {
-        finishAndSendVoiceRecording();
-      }
-    }, 1000);
+    voiceRecTimerId = setInterval(() => {
+      const sec = Math.floor((Date.now() - voiceRecStartAt) / 1000);
+      const m = Math.floor(sec / 60);
+      const s = String(sec % 60).padStart(2, '0');
+      els.voiceRecTimer.textContent = `Gravando ${m}:${s}`;
+      if (sec >= 60) finishAndSendVoiceRecording();
+    }, 500);
   }
 
-  function cleanupVoiceRecResources() {
-    clearInterval(chatRecTimer);
-    chatRecTimer = null;
-    if (chatRecStream) {
-      chatRecStream.getTracks().forEach((t) => t.stop());
-      chatRecStream = null;
+  function cleanupVoiceRecorderResources() {
+    clearInterval(voiceRecTimerId);
+    voiceRecTimerId = null;
+    if (voiceRecStream) {
+      voiceRecStream.getTracks().forEach((t) => t.stop());
+      voiceRecStream = null;
     }
-    chatRecorder = null;
+    voiceRecorder = null;
     els.voiceRecBar.classList.add('hidden');
   }
 
   function cancelVoiceRecording() {
-    if (!chatRecorder) return;
+    if (!voiceRecorder) return;
     try {
-      chatRecorder.ondataavailable = null;
-      chatRecorder.onstop = null;
-      chatRecorder.stop();
+      voiceRecorder.ondataavailable = null;
+      voiceRecorder.onstop = null;
+      if (voiceRecorder.state !== 'inactive') voiceRecorder.stop();
     } catch {}
-    chatRecChunks = [];
-    cleanupVoiceRecResources();
+    cleanupVoiceRecorderResources();
   }
 
   function finishAndSendVoiceRecording() {
-    if (!chatRecorder) return;
-    const rec = chatRecorder;
+    if (!voiceRecorder) return;
+    const rec = voiceRecorder;
     rec.onstop = () => {
-      const blob = new Blob(chatRecChunks, { type: rec.mimeType || 'audio/webm' });
-      chatRecChunks = [];
-      cleanupVoiceRecResources();
-      if (blob.size < 200) return;
+      const blob = new Blob(voiceRecChunks, { type: rec.mimeType || 'audio/webm' });
+      cleanupVoiceRecorderResources();
+      if (blob.size < 400) return;
 
       const reader = new FileReader();
       reader.onload = () => {
         socket.emit(
           'chat-message',
-          { text: '', audio: reader.result, replyToId: state.replyingToId },
+          {
+            text: '',
+            audio: reader.result,
+            replyToId: state.replyingToMsg ? state.replyingToMsg.id : null,
+          },
           (res) => {
             if (res && !res.ok && res.error) showToast(res.error, 'error');
           }
@@ -1891,7 +1867,7 @@
     try {
       rec.stop();
     } catch {
-      cleanupVoiceRecResources();
+      cleanupVoiceRecorderResources();
     }
   }
 
@@ -1899,7 +1875,7 @@
   els.cancelRecBtn.addEventListener('click', cancelVoiceRecording);
   els.sendRecBtn.addEventListener('click', finishAndSendVoiceRecording);
 
-  // ==================== ENVIO DE TEXTO E IMAGENS ====================
+  // ==================== ENVIO DE TEXTO E IMAGEM ====================
 
   let typingSent = false;
   let typingStopTimer = null;
@@ -1923,7 +1899,7 @@
 
   els.chatInput.addEventListener('input', () => {
     autoResizeTextarea();
-    if (els.chatInput.value.trim().length > 0 && !state.editingMessageId) {
+    if (els.chatInput.value.trim().length > 0 && !state.editingMsgId) {
       notifyTyping();
     }
   });
@@ -1984,34 +1960,29 @@
   }
 
   els.removeImageBtn.addEventListener('click', clearPendingImage);
-
-  els.emojiBtn.addEventListener('click', () => {
-    els.emojiBar.classList.toggle('hidden');
-  });
+  els.emojiBtn.addEventListener('click', () => els.emojiBar.classList.toggle('hidden'));
 
   els.chatForm.addEventListener('submit', (e) => {
     e.preventDefault();
     const text = els.chatInput.value.trim();
 
-    if (state.editingMessageId) {
+    if (state.editingMsgId) {
       if (!text) return;
-      socket.emit('chat-edit', { messageId: state.editingMessageId, text }, (res) => {
+      const targetId = state.editingMsgId;
+      clearComposerContext();
+      socket.emit('chat-edit', { messageId: targetId, text }, (res) => {
         if (res && !res.ok && res.error) showToast(res.error, 'error');
       });
-      clearComposerContext();
       return;
     }
 
     const image = state.pendingImageDataUrl;
     if (!text && !image) return;
 
-    socket.emit(
-      'chat-message',
-      { text, image, replyToId: state.replyingToId },
-      (res) => {
-        if (res && !res.ok && res.error) showToast(res.error, 'error');
-      }
-    );
+    const replyToId = state.replyingToMsg ? state.replyingToMsg.id : null;
+    socket.emit('chat-message', { text, image, replyToId }, (res) => {
+      if (res && !res.ok && res.error) showToast(res.error, 'error');
+    });
 
     els.chatInput.value = '';
     autoResizeTextarea();
@@ -2027,18 +1998,19 @@
 
   // ==================== CONFIGURAÇÕES, TEMAS E PUSH-TO-TALK ====================
 
-  function updatePttBindLabel() {
-    els.pttBindBtn.textContent = state.bindingPttKey
-      ? 'Pressione qualquer tecla...'
-      : `Tecla atual: ${state.pttKeyLabel} (clique p/ trocar)`;
+  function updatePttUiControls() {
+    els.voiceModeSelect.value = state.voiceMode;
+    els.pttKeyBox.classList.toggle('hidden', state.voiceMode !== 'ptt');
+    els.pttBindBtn.textContent = `Tecla atual: ${state.pttKeyLabel} (clique para trocar)`;
   }
 
   async function openSettingsModal() {
     els.settingsModal.classList.remove('hidden');
-    renderRoomMetaUI();
+    els.themeSelect.value = state.theme;
+    updatePttUiControls();
+    els.hostSecuritySection.classList.toggle('hidden', !isSelfHost());
 
     const [mics, cams] = await Promise.all([voice.listMicrophones(), voice.listCameras()]);
-
     els.micSelect.innerHTML = '';
     if (mics.length === 0) {
       const opt = document.createElement('option');
@@ -2071,15 +2043,11 @@
       });
     }
 
-    els.themeSelect.value = state.theme;
-    els.voiceModeSelect.value = state.voiceMode;
-    els.pttKeyBox.classList.toggle('hidden', state.voiceMode !== 'ptt');
     els.qualitySelect.value = voice.screenQuality;
   }
 
   function closeSettingsModal() {
     state.bindingPttKey = false;
-    updatePttBindLabel();
     els.settingsModal.classList.add('hidden');
   }
 
@@ -2090,30 +2058,24 @@
     if (e.target === els.settingsModal) closeSettingsModal();
   });
 
-  els.themeSelect.addEventListener('change', () => {
-    applyTheme(els.themeSelect.value);
-    showToast(`Tema: ${THEME_LABELS[state.theme]}`, 'info');
-  });
-
+  els.themeSelect.addEventListener('change', () => applyTheme(els.themeSelect.value));
   els.themeQuickBtn.addEventListener('click', () => {
     const nextIdx = (THEMES.indexOf(state.theme) + 1) % THEMES.length;
     applyTheme(THEMES[nextIdx]);
-    showToast(`Tema alterado para ${THEME_LABELS[state.theme]}!`, 'info');
+    showToast(`Tema: ${els.themeSelect.options[nextIdx]?.text || THEMES[nextIdx]}`, 'info');
   });
 
   els.voiceModeSelect.addEventListener('change', () => {
     state.voiceMode = els.voiceModeSelect.value;
     localStorage.setItem('resenha_voice_mode', state.voiceMode);
-    const ptt = state.voiceMode === 'ptt';
-    els.pttKeyBox.classList.toggle('hidden', !ptt);
-    voice.setPttMode(ptt);
+    voice.setPttMode(state.voiceMode === 'ptt');
+    updatePttUiControls();
     renderMembers();
-    showToast(ptt ? `Push-to-Talk ativado (segure ${state.pttKeyLabel})` : 'Voz Livre ativada!', 'success');
   });
 
   els.pttBindBtn.addEventListener('click', () => {
     state.bindingPttKey = true;
-    updatePttBindLabel();
+    els.pttBindBtn.textContent = 'Pressione qualquer tecla agora...';
   });
 
   els.micSelect.addEventListener('change', async () => {
@@ -2125,7 +2087,7 @@
   els.camSelect.addEventListener('change', async () => {
     const res = await voice.switchCamera(els.camSelect.value);
     if (!res.ok) showToast(res.error || 'Erro ao trocar câmera.', 'error');
-    else showToast('Câmera alterada!', 'success');
+    else showToast('Câmera selecionada!', 'success');
   });
 
   els.qualitySelect.addEventListener('change', async () => {
@@ -2167,9 +2129,8 @@
 
   els.copyInviteSidebarBtn.addEventListener('click', copyInviteLink);
   els.copyInviteTopBtn.addEventListener('click', copyInviteLink);
-  els.leaveRoomBtn.addEventListener('click', leaveRoom);
+  els.leaveRoomBtn.addEventListener('click', () => leaveRoom());
 
-  // Mobile sidebar
   function openMobileSidebar() {
     els.sidebar.classList.add('open');
     els.sidebarBackdrop.classList.remove('hidden');
@@ -2181,7 +2142,7 @@
   els.mobileMenuBtn.addEventListener('click', openMobileSidebar);
   els.sidebarBackdrop.addEventListener('click', closeMobileSidebar);
 
-  // ==================== ATALHOS E TECLAS DO PUSH-TO-TALK ====================
+  // ==================== TECLADO GLOBAL (ATALHOS E PUSH-TO-TALK) ====================
 
   function isTypingInField(target) {
     if (!target) return false;
@@ -2192,24 +2153,20 @@
   document.addEventListener('keydown', (e) => {
     if (state.bindingPttKey) {
       e.preventDefault();
-      if (e.key === 'Escape') {
-        state.bindingPttKey = false;
-        updatePttBindLabel();
-        return;
-      }
-      state.pttKeyCode = e.code;
-      state.pttKeyLabel = e.key === ' ' ? 'Espaço' : e.key.length === 1 ? e.key.toUpperCase() : e.key;
-      localStorage.setItem('resenha_ptt_key', state.pttKeyCode);
-      localStorage.setItem('resenha_ptt_label', state.pttKeyLabel);
       state.bindingPttKey = false;
-      updatePttBindLabel();
+      if (e.key !== 'Escape') {
+        state.pttKeyCode = e.code;
+        state.pttKeyLabel = e.key === ' ' ? 'Espaço' : e.key.length === 1 ? e.key.toUpperCase() : e.key;
+        localStorage.setItem('resenha_ptt_key', state.pttKeyCode);
+        localStorage.setItem('resenha_ptt_label', state.pttKeyLabel);
+      }
+      updatePttUiControls();
       updateVoiceDockUI();
-      showToast(`Tecla Push-to-Talk definida: ${state.pttKeyLabel}`, 'success');
       return;
     }
 
     if (e.key === 'Escape') {
-      if (state.editingMessageId || state.replyingToId) {
+      if (state.editingMsgId || state.replyingToMsg) {
         clearComposerContext();
         return;
       }
@@ -2234,8 +2191,8 @@
       return;
     }
 
-    // Push-to-Talk
-    if (voice.pttEnabled && e.code === state.pttKeyCode && !isTypingInField(e.target)) {
+    if (state.voiceMode === 'ptt' && e.code === state.pttKeyCode && !isTypingInField(e.target)) {
+      e.preventDefault();
       if (!e.repeat) {
         voice.setPttActive(true);
         renderMembers();
@@ -2244,14 +2201,14 @@
   });
 
   document.addEventListener('keyup', (e) => {
-    if (voice.inVoice && voice.pttEnabled && e.code === state.pttKeyCode) {
+    if (state.voiceMode === 'ptt' && e.code === state.pttKeyCode) {
       voice.setPttActive(false);
       renderMembers();
     }
   });
 
   window.addEventListener('blur', () => {
-    if (voice.inVoice && voice.pttEnabled && voice.pttPressed) {
+    if (state.voiceMode === 'ptt') {
       voice.setPttActive(false);
       renderMembers();
     }
