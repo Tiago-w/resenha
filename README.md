@@ -2,6 +2,17 @@
 
 Um web app completo e leve (estilo Discord) para você e seus amigos conversarem por **voz**, ligarem **webcam**, **transmitirem tela em até 4K (com áudio)**, tocarem efeitos na **Mesa de Sons** e trocarem **mensagens, áudios e prints** direto pelo navegador — sem precisar de cadastro nem instalar nada.
 
+## Prévia do Programa
+
+### Sala ao vivo — Voz, Transmissão 4K com Apontador (🎯) e Chat com Reações/Reply
+![Sala ao vivo do Resenha 2.0](docs/screenshots/02-sala-voz-tela.png)
+
+| Entrada rápida (Lobby) | Mesa de Sons (Soundboard) + Tema Cyber |
+| --- | --- |
+| ![Lobby do Resenha](docs/screenshots/01-lobby.png) | ![Soundboard e Tema Cyber](docs/screenshots/03-soundboard-temas.png) |
+
+---
+
 ## Recursos
 
 ### 🎙️ Voz Híbrida (100% Autônoma, sem bloqueio de CGNAT)
